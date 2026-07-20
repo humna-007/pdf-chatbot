@@ -74,6 +74,10 @@ def retrieve_chunks(query, index, chunks, model, k):
         query_embedding = model.encode([query]).astype("float32")
         distances, indices = index.search(query_embedding, k)
         retrieved = [chunks[i] for i in indices[0] if i < len(chunks)]
+
+        if not retrieved:
+            return None, "No relevant content found in the document for this question."
+
         return retrieved, None
     except Exception as e:
         return None, f"Retrieval failed: {e}"
@@ -84,7 +88,6 @@ def generate_answer(client, query, context_chunks):
     try:
         context = "\n\n".join(context_chunks)
 
-        # LLM 1: Context Summarizer
         summary_response = client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[
@@ -95,7 +98,6 @@ def generate_answer(client, query, context_chunks):
         )
         context_summary = summary_response.choices[0].message.content
 
-        # LLM 2: Answer Generator
         answer_response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[
@@ -109,14 +111,26 @@ def generate_answer(client, query, context_chunks):
         return final_answer, context_summary, None
 
     except Exception as e:
-        return None, None, f"Answer generation failed: {e}"
-
+        error_msg = str(e).lower()
+        if "401" in error_msg or "invalid api key" in error_msg or "unauthorized" in error_msg:
+            return None, None, "Invalid Groq API key. Please check the key in the sidebar and try again."
+        elif "429" in error_msg or "rate limit" in error_msg:
+            return None, None, "Groq API rate limit reached. Please wait a moment and try again."
+        elif "timeout" in error_msg:
+            return None, None, "Request timed out. Please check your internet connection and try again."
+        else:
+            return None, None, f"Answer generation failed: {e}"
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
     st.header("Configuration")
     groq_api_key = st.text_input("Enter your Groq API Key", type="password")
+
     uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+    if uploaded_file is not None and uploaded_file.size > 20 * 1024 * 1024:  # 20MB
+        st.error("File too large. Please upload a PDF under 20MB.")
+        uploaded_file = None
+
     top_k = st.slider("Number of chunks to retrieve", min_value=1, max_value=5, value=3)
 
 # ---------------- MAIN AREA ----------------
@@ -171,7 +185,7 @@ else:
 
                 user_question = st.chat_input("Type your question here...")
 
-                if user_question:
+                if user_question and user_question.strip():
                     st.session_state["messages"].append({"role": "user", "content": user_question})
                     with st.chat_message("user"):
                         st.write(user_question)
