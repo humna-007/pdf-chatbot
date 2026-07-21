@@ -1,20 +1,37 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 from groq import Groq
+from datetime import datetime
+import uuid
 
-st.set_page_config(page_title="PDF ChatBot with RAG", page_icon="📄", layout="wide")
+st.set_page_config(page_title="PDF Chat", page_icon="💬", layout="wide")
 
-st.title("📄 PDF ChatBot with RAG & Dual LLM Architecture")
-st.write("Upload a PDF and ask questions about its content.")
+st.markdown("""
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif; font-weight: 700; letter-spacing: -0.5px; }
+    section[data-testid="stSidebar"] { background-color: #F8F7FC; border-right: 1px solid #E8E6F5; }
+    .stButton button { background-color: #6C5CE7; color: white; border-radius: 10px; border: none; font-weight: 500; }
+    .stButton button:hover { background-color: #5B4BD6; }
+    section[data-testid="stFileUploaderDropzone"] {
+        border: 2px dashed #6C5CE7 !important; border-radius: 16px !important; background-color: #FAFAFF !important;
+    }
+    .stChatMessage { border-radius: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .stExpander { border: 1px solid #E8E6F5; border-radius: 12px; }
+    .welcome-text { font-size: 1.3rem; color: #6B6B76; text-align: center; margin-bottom: 0.5rem; }
+    .chat-item { padding: 6px 10px; border-radius: 8px; font-size: 0.9rem; }
+    .chat-item:hover { background-color: #EFEDFA; }
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_resource
 def load_embedding_model():
-    """Load the sentence transformer model once and cache it."""
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
@@ -22,18 +39,13 @@ def extract_text_from_pdf(uploaded_file):
     try:
         pdf_bytes = uploaded_file.read()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
         if doc.page_count == 0:
             return None, "The PDF appears to be empty (0 pages)."
-
         text = "".join(page.get_text() for page in doc)
         doc.close()
-
         if not text.strip():
             return None, "No extractable text found. This PDF might be scanned images without OCR."
-
         return text, None
-
     except Exception as e:
         return None, f"Failed to read PDF: {e}"
 
@@ -42,78 +54,82 @@ def chunk_text(text):
     try:
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
         chunks = splitter.split_text(text)
-
         if not chunks:
             return None, "Text splitting produced no chunks."
-
         return chunks, None
-
     except Exception as e:
         return None, f"Failed to split text into chunks: {e}"
 
 
 def build_vector_store(chunks, model):
-    """Embed chunks and build a FAISS index for similarity search."""
     try:
         embeddings = model.encode(chunks, show_progress_bar=False)
         embeddings = np.array(embeddings).astype("float32")
-
-        dimension = embeddings.shape[1]
-        index = faiss.IndexFlatL2(dimension)
+        index = faiss.IndexFlatL2(embeddings.shape[1])
         index.add(embeddings)
-
         return index, None
-
     except Exception as e:
         return None, f"Failed to build vector store: {e}"
 
 
 def retrieve_chunks(query, index, chunks, model, k):
-    """Find the top-k most relevant chunks for a query."""
     try:
         query_embedding = model.encode([query]).astype("float32")
         distances, indices = index.search(query_embedding, k)
         retrieved = [chunks[i] for i in indices[0] if i < len(chunks)]
-
         if not retrieved:
             return None, "No relevant content found in the document for this question."
-
         return retrieved, None
     except Exception as e:
         return None, f"Retrieval failed: {e}"
 
 
-def generate_answer(client, query, context_chunks):
-    """Run the dual-LLM pipeline: summarize context, then answer."""
+def generate_answer(client, query, context_chunks, chat_history):
     try:
         context = "\n\n".join(context_chunks)
+        recent_exchange = "\n".join(
+            f"{m['role']}: {m['content']}" for m in chat_history[-4:]
+        ) if chat_history else "No prior conversation."
 
         summary_response = client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[
-                {"role": "system", "content": "Summarize the following context concisely, focusing only on information relevant to the user's question."},
-                {"role": "user", "content": f"Question: {query}\n\nContext:\n{context}"},
+                {"role": "system", "content": (
+                    "Summarize the following document context concisely, focusing on information relevant "
+                    "to the user's current question. Use the recent conversation only to understand what "
+                    "the user is really asking (e.g. follow-ups like 'tell me more')."
+                )},
+                {"role": "user", "content": (
+                    f"Recent conversation:\n{recent_exchange}\n\n"
+                    f"Current question: {query}\n\nDocument context:\n{context}"
+                )},
             ],
             temperature=0.3,
         )
         context_summary = summary_response.choices[0].message.content
 
+        history_messages = [{"role": m["role"], "content": m["content"]} for m in chat_history[-6:]]
+
         answer_response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[
-                {"role": "system", "content": "Answer the user's question accurately based on the provided summary. If the summary doesn't contain the answer, say so."},
-                {"role": "user", "content": f"Question: {query}\n\nSummary:\n{context_summary}"},
+                {"role": "system", "content": (
+                    "You are a friendly, conversational assistant helping someone explore a PDF document. "
+                    "Answer naturally using the summary below as your source of truth. If it doesn't contain "
+                    "the answer, say so honestly. When it feels natural, briefly invite the user to dive deeper "
+                    "or ask something else — but vary your phrasing and don't force it every time."
+                )},
+                *history_messages,
+                {"role": "user", "content": f"Question: {query}\n\nRelevant summary:\n{context_summary}"},
             ],
-            temperature=0.3,
+            temperature=0.4,
         )
-        final_answer = answer_response.choices[0].message.content
-
-        return final_answer, context_summary, None
+        return answer_response.choices[0].message.content, context_summary, None
 
     except Exception as e:
         error_msg = str(e).lower()
         if "401" in error_msg or "invalid api key" in error_msg or "unauthorized" in error_msg:
-            return None, None, "Invalid Groq API key. Please check the key in the sidebar and try again."
+            return None, None, "Invalid Groq API key. Please check the key and try again."
         elif "429" in error_msg or "rate limit" in error_msg:
             return None, None, "Groq API rate limit reached. Please wait a moment and try again."
         elif "timeout" in error_msg:
@@ -121,98 +137,183 @@ def generate_answer(client, query, context_chunks):
         else:
             return None, None, f"Answer generation failed: {e}"
 
+
+def validate_groq_key(key):
+    try:
+        client = Groq(api_key=key)
+        client.models.list()
+        return True, None
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "401" in error_msg or "invalid" in error_msg or "unauthorized" in error_msg:
+            return False, "That key doesn't look valid. Please double-check it."
+        elif "timeout" in error_msg:
+            return False, "Connection timed out. Check your internet and try again."
+        else:
+            return False, f"Couldn't verify the key: {e}"
+
+
+# ---------------- API KEY GATE ----------------
+if "groq_api_key" not in st.session_state:
+    st.session_state["groq_api_key"] = None
+
+
+@st.dialog("Welcome — enter your Groq API key")
+def api_key_dialog():
+    st.caption("You'll need this once per session to power the chatbot.")
+    key_input = st.text_input("Groq API Key", type="password")
+    if st.button("Continue", use_container_width=True):
+        if not key_input or not key_input.strip():
+            st.error("Please enter a key.")
+        else:
+            with st.spinner("Verifying..."):
+                valid, err = validate_groq_key(key_input.strip())
+            if valid:
+                st.session_state["groq_api_key"] = key_input.strip()
+                st.rerun()
+            else:
+                st.error(err)
+
+
+if not st.session_state["groq_api_key"]:
+    api_key_dialog()
+    st.stop()
+
+groq_api_key = st.session_state["groq_api_key"]
+
+# ---------------- MULTI-CHAT STATE ----------------
+if "chats" not in st.session_state:
+    st.session_state["chats"] = {}  # chat_id -> {title, messages, chunks, vector_index}
+if "active_chat_id" not in st.session_state:
+    st.session_state["active_chat_id"] = None
+
+embed_model = load_embedding_model()
+
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
-    st.header("Configuration")
-    groq_api_key = st.text_input("Enter your Groq API Key", type="password")
+    st.markdown("### 💬 PDF Chat")
 
-    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
-    if uploaded_file is not None and uploaded_file.size > 20 * 1024 * 1024:  # 20MB
-        st.error("File too large. Please upload a PDF under 20MB.")
-        uploaded_file = None
+    if st.button("➕ New chat", use_container_width=True):
+        st.session_state["active_chat_id"] = None
+        st.rerun()
 
-    top_k = st.slider("Number of chunks to retrieve", min_value=1, max_value=5, value=3)
+    top_k = st.slider("Chunks to retrieve", min_value=1, max_value=5, value=3)
+
+    st.divider()
+    search_term = st.text_input("🔍 Search chats", placeholder="Search by PDF name...")
+
+    st.markdown("**Your chats**")
+    chats = st.session_state["chats"]
+
+    if not chats:
+        st.caption("No chats yet — upload a PDF to start one.")
+    else:
+        # Most recent first
+        sorted_ids = sorted(chats.keys(), key=lambda cid: chats[cid]["created_at"], reverse=True)
+        filtered_ids = [
+            cid for cid in sorted_ids
+            if not search_term or search_term.lower() in chats[cid]["title"].lower()
+        ]
+
+        if not filtered_ids:
+            st.caption("No chats match your search.")
+
+        for cid in filtered_ids:
+            chat = chats[cid]
+            is_active = cid == st.session_state["active_chat_id"]
+            label = f"{'🟣 ' if is_active else ''}{chat['title']}"
+            if st.button(label, key=f"chat_btn_{cid}", use_container_width=True):
+                st.session_state["active_chat_id"] = cid
+                st.rerun()
 
 # ---------------- MAIN AREA ----------------
-if not groq_api_key:
-    st.warning("Please enter your Groq API key in the sidebar to continue.")
-elif not uploaded_file:
-    st.info("Please upload a PDF file to start chatting.")
-else:
-    with st.spinner("Extracting text from PDF..."):
-        extracted_text, error = extract_text_from_pdf(uploaded_file)
+active_id = st.session_state["active_chat_id"]
 
-    if error:
-        st.error(error)
-    else:
-        with st.spinner("Splitting text into chunks..."):
-            chunks, chunk_error = chunk_text(extracted_text)
+if active_id is None:
+    hour = datetime.now().hour
+    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
 
-        if chunk_error:
-            st.error(chunk_error)
+    st.markdown(f"<h2 style='text-align:center;'>{greeting} 👋</h2>", unsafe_allow_html=True)
+    st.markdown("<p class='welcome-text'>Upload a PDF to start a new chat.</p>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        uploaded_file = st.file_uploader("Drop your PDF here", type=["pdf"], label_visibility="collapsed")
+
+    if uploaded_file is not None:
+        if uploaded_file.size > 20 * 1024 * 1024:
+            st.error("File too large. Please upload a PDF under 20MB.")
         else:
-            with st.spinner("Generating embeddings and building vector index..."):
-                embed_model = load_embedding_model()
-                vector_index, index_error = build_vector_store(chunks, embed_model)
+            with st.spinner("Reading your PDF..."):
+                extracted_text, error = extract_text_from_pdf(uploaded_file)
 
-            if index_error:
-                st.error(index_error)
+            if error:
+                st.error(error)
             else:
-                st.success(f"PDF processed: {uploaded_file.name} ({len(extracted_text)} characters, {len(chunks)} chunks indexed)")
+                with st.spinner("Indexing content..."):
+                    chunks, chunk_error = chunk_text(extracted_text)
 
-                st.session_state["chunks"] = chunks
-                st.session_state["vector_index"] = vector_index
-                st.session_state["embed_model"] = embed_model
+                if chunk_error:
+                    st.error(chunk_error)
+                else:
+                    with st.spinner("Preparing semantic search..."):
+                        vector_index, index_error = build_vector_store(chunks, embed_model)
 
-                with st.expander("Preview extracted text"):
-                    st.text(extracted_text[:5000])
+                    if index_error:
+                        st.error(index_error)
+                    else:
+                        new_id = str(uuid.uuid4())
+                        st.session_state["chats"][new_id] = {
+                            "title": uploaded_file.name,
+                            "messages": [],
+                            "chunks": chunks,
+                            "vector_index": vector_index,
+                            "created_at": datetime.now().timestamp(),
+                        }
+                        st.session_state["active_chat_id"] = new_id
+                        st.rerun()
 
-                with st.expander(f"Preview chunks ({len(chunks)} total)"):
-                    for i, chunk in enumerate(chunks[:3]):
-                        st.markdown(f"**Chunk {i+1}:**")
-                        st.text(chunk)
-                        st.divider()
+else:
+    chat = st.session_state["chats"][active_id]
+    chunks = chat["chunks"]
+    vector_index = chat["vector_index"]
 
-                st.divider()
-                st.subheader("💬 Ask a question about your PDF")
+    st.success(f"Chatting about **{chat['title']}** ({len(chunks)} sections indexed)")
 
-                if "messages" not in st.session_state:
-                    st.session_state["messages"] = []
+    for msg in chat["messages"]:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
 
-                for msg in st.session_state["messages"]:
-                    with st.chat_message(msg["role"]):
-                        st.write(msg["content"])
+    user_question = st.chat_input("Ask something about this document...")
 
-                user_question = st.chat_input("Type your question here...")
+    if user_question and user_question.strip():
+        chat["messages"].append({"role": "user", "content": user_question})
+        with st.chat_message("user"):
+            st.write(user_question)
 
-                if user_question and user_question.strip():
-                    st.session_state["messages"].append({"role": "user", "content": user_question})
-                    with st.chat_message("user"):
-                        st.write(user_question)
+        with st.chat_message("assistant"):
+            with st.spinner("Extracting relevant sections..."):
+                retrieved, retrieve_error = retrieve_chunks(user_question, vector_index, chunks, embed_model, top_k)
 
-                    with st.chat_message("assistant"):
-                        with st.spinner("Searching document..."):
-                            retrieved, retrieve_error = retrieve_chunks(
-                                user_question, vector_index, chunks, embed_model, top_k
-                            )
+            if retrieve_error:
+                st.error(retrieve_error)
+            else:
+                with st.spinner("Thinking..."):
+                    client = Groq(api_key=groq_api_key)
+                    answer, summary, gen_error = generate_answer(
+                        client, user_question, retrieved, chat["messages"]
+                    )
 
-                        if retrieve_error:
-                            st.error(retrieve_error)
-                        else:
-                            with st.spinner("Generating answer..."):
-                                client = Groq(api_key=groq_api_key)
-                                answer, summary, gen_error = generate_answer(client, user_question, retrieved)
+                if gen_error:
+                    st.error(gen_error)
+                else:
+                    st.write(answer)
+                    chat["messages"].append({"role": "assistant", "content": answer})
 
-                            if gen_error:
-                                st.error(gen_error)
-                            else:
-                                st.write(answer)
-                                st.session_state["messages"].append({"role": "assistant", "content": answer})
-
-                                with st.expander("View context summary"):
-                                    st.write(summary)
-                                with st.expander("View retrieved chunks"):
-                                    for i, c in enumerate(retrieved):
-                                        st.markdown(f"**Chunk {i+1}:**")
-                                        st.text(c)
-                                        st.divider()
+                    with st.expander("View context summary"):
+                        st.write(summary)
+                    with st.expander("View retrieved chunks"):
+                        for i, c in enumerate(retrieved):
+                            st.markdown(f"**Chunk {i+1}:**")
+                            st.text(c)
+                            st.divider()
