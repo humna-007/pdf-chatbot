@@ -7,6 +7,11 @@ import numpy as np
 from groq import Groq
 from datetime import datetime
 import uuid
+import pytesseract
+from PIL import Image
+import io
+
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 st.set_page_config(page_title="PDF Chat", page_icon="💬", layout="wide")
 
@@ -39,13 +44,28 @@ def extract_text_from_pdf(uploaded_file):
     try:
         pdf_bytes = uploaded_file.read()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
         if doc.page_count == 0:
             return None, "The PDF appears to be empty (0 pages)."
+
         text = "".join(page.get_text() for page in doc)
-        doc.close()
+
+        # Fallback: if normal extraction found nothing, try OCR on rendered pages
         if not text.strip():
-            return None, "No extractable text found. This PDF might be scanned images without OCR."
+            ocr_text = ""
+            for page in doc:
+                pix = page.get_pixmap(dpi=200)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr_text += pytesseract.image_to_string(img)
+            text = ocr_text
+
+        doc.close()
+
+        if not text.strip():
+            return None, "No extractable text found, even after OCR. This PDF might be a low-quality scan."
+
         return text, None
+
     except Exception as e:
         return None, f"Failed to read PDF: {e}"
 
@@ -152,7 +172,7 @@ def validate_groq_key(key):
         else:
             return False, f"Couldn't verify the key: {e}"
 
-
+embed_model = load_embedding_model()
 # ---------------- API KEY GATE ----------------
 if "groq_api_key" not in st.session_state:
     st.session_state["groq_api_key"] = None
@@ -166,8 +186,12 @@ def api_key_dialog():
         if not key_input or not key_input.strip():
             st.error("Please enter a key.")
         else:
-            with st.spinner("Verifying..."):
+            placeholder = st.empty()
+            with placeholder.container():
+                st.spinner("Verifying...")
                 valid, err = validate_groq_key(key_input.strip())
+            placeholder.empty()
+
             if valid:
                 st.session_state["groq_api_key"] = key_input.strip()
                 st.rerun()
@@ -187,7 +211,6 @@ if "chats" not in st.session_state:
 if "active_chat_id" not in st.session_state:
     st.session_state["active_chat_id"] = None
 
-embed_model = load_embedding_model()
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
@@ -221,8 +244,8 @@ with st.sidebar:
         for cid in filtered_ids:
             chat = chats[cid]
             is_active = cid == st.session_state["active_chat_id"]
-            label = f"{'🟣 ' if is_active else ''}{chat['title']}"
-            if st.button(label, key=f"chat_btn_{cid}", use_container_width=True):
+            button_type = "primary" if is_active else "secondary"
+            if st.button(chat["title"], key=f"chat_btn_{cid}", use_container_width=True, type=button_type):
                 st.session_state["active_chat_id"] = cid
                 st.rerun()
 
